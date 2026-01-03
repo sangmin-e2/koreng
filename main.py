@@ -35,6 +35,8 @@ def log_debug(message):
 DOT_SIZE = 22  # 18에서 20% 증가 (18 * 1.2 = 21.6 → 22)
 OFFSET_X = 6
 OFFSET_Y = 10
+CURSOR_OFFSET_X = 25  # 마우스 커서 기반 위치일 때 추가 오프셋 (오른쪽)
+CURSOR_OFFSET_Y = 25  # 마우스 커서 기반 위치일 때 추가 오프셋 (아래쪽)
 TICK_MS = 80
 
 ENG_FILL = "#ff9800"  # 오렌지 (E일 때)
@@ -174,7 +176,7 @@ def is_hangul_toggled() -> bool:
 def get_caret_screen_pos():
     hwnd_fg = user32.GetForegroundWindow()
     if not hwnd_fg:
-        return None, None, None, None
+        return None, None, None, None, False
 
     tid = get_foreground_thread_id(hwnd_fg)
 
@@ -186,7 +188,7 @@ def get_caret_screen_pos():
     if gti_success and gti.hwndCaret:
         pt = POINT(gti.rcCaret.left, gti.rcCaret.bottom)
         if user32.ClientToScreen(gti.hwndCaret, ctypes.byref(pt)):
-            return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus
+            return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus, False  # False = 캐럿 기반
 
     # 캐럿이 없을 때 (크롬, 시스템 앱 등)
     # 1. 마우스 커서 위치를 우선 사용 (사용자가 입력하려는 위치 근처)
@@ -197,7 +199,7 @@ def get_caret_screen_pos():
         if user32.GetWindowRect(hwnd_fg, ctypes.byref(rect)):
             # 마우스가 윈도우 내부에 있으면 마우스 위치 사용
             if (rect.left <= pt.x <= rect.right and rect.top <= pt.y <= rect.bottom):
-                return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None
+                return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None, True  # True = 마우스 커서 기반
     
     # 2. 포커스된 윈도우 또는 포그라운드 윈도우의 위치 사용
     hwnd_target = None
@@ -219,14 +221,14 @@ def get_caret_screen_pos():
             # 윈도우 경계 내로 제한
             badge_x = max(rect.left + 20, min(badge_x, rect.right - DOT_SIZE - 20))
             badge_y = max(rect.top + 20, min(badge_y, rect.bottom - DOT_SIZE - 20))
-            return (badge_x, badge_y), hwnd_fg, tid, hwnd_target if gti_success else None
+            return (badge_x, badge_y), hwnd_fg, tid, hwnd_target if gti_success else None, False  # False = 윈도우 위치 기반
     
     # 3. 최후의 수단: 마우스 커서 위치 (윈도우 밖이어도)
     pt = POINT()
     if user32.GetCursorPos(ctypes.byref(pt)):
-        return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None
+        return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None, True  # True = 마우스 커서 기반
     
-    return None, hwnd_fg, tid, gti.hwndFocus if gti_success else None
+    return None, hwnd_fg, tid, gti.hwndFocus if gti_success else None, False
 
 def is_hangul_mode(hwnd_focus: int) -> bool:
     """
@@ -423,7 +425,7 @@ def tick():
         control_root.after(120, tick)
         return
 
-    pos, hwnd_fg, tid, hwnd_focus = get_caret_screen_pos()
+    pos, hwnd_fg, tid, hwnd_focus, is_cursor_based = get_caret_screen_pos()
     if not hwnd_fg:
         # 포그라운드 윈도우가 없으면 배지 숨김
         root.withdraw()
@@ -439,11 +441,13 @@ def tick():
             center_x = (rect.left + rect.right) // 2
             center_y = (rect.top + rect.bottom) // 2
             pos = (center_x - 100, center_y - 50)
+            is_cursor_based = False
         else:
             # GetWindowRect 실패 시 마우스 커서 위치 사용
             pt = POINT()
             if user32.GetCursorPos(ctypes.byref(pt)):
                 pos = (pt.x, pt.y)
+                is_cursor_based = True
             else:
                 # 모든 방법 실패 시 배지 숨김
                 root.withdraw()
@@ -485,7 +489,11 @@ def tick():
     canvas.itemconfig(label, text=text)
 
     x, y = pos
-    gx, gy = clamp_to_monitor(x + OFFSET_X, y + OFFSET_Y)
+    # 마우스 커서 기반 위치일 때 추가 오프셋 적용
+    if is_cursor_based:
+        gx, gy = clamp_to_monitor(x + OFFSET_X + CURSOR_OFFSET_X, y + OFFSET_Y + CURSOR_OFFSET_Y)
+    else:
+        gx, gy = clamp_to_monitor(x + OFFSET_X, y + OFFSET_Y)
 
     # 배지 표시 (test_badge와 완전히 동일한 순서)
     # 1. 캔버스 먼저 업데이트
