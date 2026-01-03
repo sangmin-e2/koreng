@@ -230,34 +230,51 @@ def get_caret_screen_pos():
     
     return None, hwnd_fg, tid, gti.hwndFocus if gti_success else None, False
 
-def is_hangul_mode(hwnd_focus: int) -> bool:
+def is_hangul_mode(hwnd_focus: int, force_refresh: bool = False, retry_count: int = 0) -> bool:
     """
     가능한 순서:
     1) IMM32 conversion status (레거시 앱에서 잘 됨)
     2) VK_HANGUL 토글 상태 (TSF 앱에서도 비교적 잘 됨)
+    
+    force_refresh: 앱 전환 시 IME 상태를 강제로 다시 확인
+    retry_count: 재시도 횟수 (앱 전환 시 여러 번 확인)
     """
     # 포커스 핸들이 없으면 폴백
     if not hwnd_focus:
         return is_hangul_toggled()
 
-    himc = imm32.ImmGetContext(hwnd_focus)
-    if not himc:
-        # TSF 기반 앱에서 자주 발생 → 폴백
-        return is_hangul_toggled()
+    # 앱 전환 시 IME 상태를 강제로 새로고침하기 위해 약간의 지연
+    if force_refresh or retry_count > 0:
+        time.sleep(0.02)  # 20ms 지연으로 IME 상태 업데이트 대기
 
-    try:
-        conv = wt.DWORD(0)
-        sent = wt.DWORD(0)
-        ok = bool(imm32.ImmGetConversionStatus(himc, ctypes.byref(conv), ctypes.byref(sent)))
-        if ok:
-            # 일부 앱은 ok=True인데 conv가 항상 0인 경우가 있음 → 그때도 폴백
-            if conv.value != 0:
+    # 여러 소스에서 IME 상태 확인
+    imm_result = None
+    vk_result = is_hangul_toggled()
+    
+    himc = imm32.ImmGetContext(hwnd_focus)
+    if himc:
+        try:
+            conv = wt.DWORD(0)
+            sent = wt.DWORD(0)
+            ok = bool(imm32.ImmGetConversionStatus(himc, ctypes.byref(conv), ctypes.byref(sent)))
+            if ok and conv.value != 0:
                 # IME_CMODE_NATIVE가 설정되어 있으면 한글 모드
-                return bool(conv.value & IME_CMODE_NATIVE)
-        # IMM32가 실패하면 VK_HANGUL 토글 상태로 폴백
-        return is_hangul_toggled()
-    finally:
-        imm32.ImmReleaseContext(hwnd_focus, himc)
+                imm_result = bool(conv.value & IME_CMODE_NATIVE)
+        finally:
+            imm32.ImmReleaseContext(hwnd_focus, himc)
+    
+    # 결과 판단
+    if imm_result is not None:
+        # IMM32 결과가 있으면 사용하되, VK_HANGUL과 비교
+        # 앱 전환 직후에는 VK_HANGUL이 더 정확할 수 있음
+        if force_refresh or retry_count > 0:
+            # 앱 전환 시에는 VK_HANGUL을 우선 (더 신뢰할 수 있음)
+            if imm_result != vk_result:
+                return vk_result
+        return imm_result
+    else:
+        # IMM32 결과가 없으면 VK_HANGUL 사용
+        return vk_result
 
 def make_click_through(hwnd: int):
     GWL_EXSTYLE = -20
@@ -293,7 +310,7 @@ def clamp_to_monitor(x: int, y: int):
 
 # 제어 창 (메인 Tk 인스턴스)
 control_root = tk.Tk()
-control_root.title("koreng")
+control_root.title("KORENG | 코랭")
 control_root.geometry("400x200")
 control_root.resizable(False, False)
 
@@ -342,6 +359,8 @@ def show_and_move(px: int, py: int):
 is_running = False
 _last_badge = None
 _last_log_time = 0.0
+_last_hwnd_fg = None  # 이전 포그라운드 윈도우 추적 (앱 전환 감지용)
+_app_switch_count = 0  # 앱 전환 후 몇 틱 동안 더 정확하게 확인
 
 def start_badge():
     global is_running
@@ -395,8 +414,11 @@ def on_closing():
 
 control_root.protocol("WM_DELETE_WINDOW", on_closing)
 
-title_label = tk.Label(control_root, text="koreng", font=("Segoe UI", 14, "bold"))
+title_label = tk.Label(control_root, text="KORENG | 코랭", font=("Segoe UI", 14, "bold"))
 title_label.pack(pady=10)
+
+developer_label = tk.Label(control_root, text="개발자 : 이상민", font=("Segoe UI", 8))
+developer_label.pack(pady=0)
 
 status_label = tk.Label(control_root, text="상태: 중지됨", font=("Segoe UI", 10))
 status_label.pack(pady=5)
@@ -421,6 +443,8 @@ stop_button.pack(side=tk.LEFT, padx=5)
 # ============================================================================
 
 def tick():
+    global _last_badge, _last_log_time, _last_hwnd_fg, _app_switch_count
+    
     if not is_running:
         control_root.after(120, tick)
         return
@@ -429,8 +453,18 @@ def tick():
     if not hwnd_fg:
         # 포그라운드 윈도우가 없으면 배지 숨김
         root.withdraw()
+        _last_hwnd_fg = None
         control_root.after(TICK_MS, tick)
         return
+    
+    # 앱 전환 감지
+    global _app_switch_count
+    app_switched = (_last_hwnd_fg is not None and _last_hwnd_fg != hwnd_fg)
+    if app_switched:
+        _app_switch_count = 3  # 앱 전환 후 3틱 동안 더 정확하게 확인
+    elif _app_switch_count > 0:
+        _app_switch_count -= 1
+    _last_hwnd_fg = hwnd_fg
     
     # pos가 없어도 hwnd_fg가 있으면 무조건 배지 표시 (크롬, 시스템 앱 대응)
     if not pos:
@@ -463,7 +497,10 @@ def tick():
     hangul_now = False
     if langid == KOREAN_LANGID:
         # 한국어 키보드 레이아웃일 때만 한글 모드 확인
-        hangul_now = is_hangul_mode(hwnd_focus)
+        # 앱 전환 시 IME 상태를 강제로 다시 확인 (여러 번 확인)
+        is_refreshing = app_switched or _app_switch_count > 0
+        retry = 2 if app_switched else 0  # 앱 전환 직후에는 2번 더 확인
+        hangul_now = is_hangul_mode(hwnd_focus, force_refresh=is_refreshing, retry_count=retry)
     else:
         # 영어 레이아웃일 때는 무조건 영어
         hangul_now = False
@@ -473,9 +510,9 @@ def tick():
     text = "K" if hangul_now else "E"
 
     # 로그는 상태 바뀔 때만 (멈춤 방지)
-    global _last_badge, _last_log_time
-    if text != _last_badge:
-        log_debug(f"레이아웃TID={tid_layout} langid=0x{langid:04x}  VK_HANGUL={is_hangul_toggled()}  -> badge={text}")
+    if text != _last_badge or app_switched:
+        app_switch_msg = " [앱 전환]" if app_switched else ""
+        log_debug(f"레이아웃TID={tid_layout} langid=0x{langid:04x}  VK_HANGUL={is_hangul_toggled()}  -> badge={text}{app_switch_msg}")
         _last_badge = text
     else:
         # 너무 조용하면 1초에 1번 정도만
