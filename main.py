@@ -113,6 +113,12 @@ user32.GetKeyboardLayout.argtypes = [wt.DWORD]
 user32.GetKeyboardLayout.restype = wt.HKL
 user32.GetKeyState.argtypes = [wt.INT]
 user32.GetKeyState.restype = wt.SHORT
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetCursorPos.restype = wt.BOOL
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wt.BOOL
+user32.GetClientRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.GetClientRect.restype = wt.BOOL
 
 # 한/영 토글 키 코드
 VK_HANGUL = 0x15  # Hangul toggle key
@@ -174,17 +180,53 @@ def get_caret_screen_pos():
 
     gti = GUITHREADINFO()
     gti.cbSize = ctypes.sizeof(GUITHREADINFO)
-    if not user32.GetGUIThreadInfo(tid, ctypes.byref(gti)):
-        return None, hwnd_fg, tid, None
+    gti_success = user32.GetGUIThreadInfo(tid, ctypes.byref(gti))
+    
+    # 캐럿이 있는 경우 (가장 정확) - 문서 앱 등에서 작동
+    if gti_success and gti.hwndCaret:
+        pt = POINT(gti.rcCaret.left, gti.rcCaret.bottom)
+        if user32.ClientToScreen(gti.hwndCaret, ctypes.byref(pt)):
+            return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus
 
-    if not gti.hwndCaret:
-        return None, hwnd_fg, tid, gti.hwndFocus
-
-    pt = POINT(gti.rcCaret.left, gti.rcCaret.bottom)
-    if not user32.ClientToScreen(gti.hwndCaret, ctypes.byref(pt)):
-        return None, hwnd_fg, tid, gti.hwndFocus
-
-    return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus
+    # 캐럿이 없을 때 (크롬, 시스템 앱 등)
+    # 1. 마우스 커서 위치를 우선 사용 (사용자가 입력하려는 위치 근처)
+    pt = POINT()
+    if user32.GetCursorPos(ctypes.byref(pt)):
+        # 마우스 커서가 포그라운드 윈도우 내부에 있는지 확인
+        rect = RECT()
+        if user32.GetWindowRect(hwnd_fg, ctypes.byref(rect)):
+            # 마우스가 윈도우 내부에 있으면 마우스 위치 사용
+            if (rect.left <= pt.x <= rect.right and rect.top <= pt.y <= rect.bottom):
+                return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None
+    
+    # 2. 포커스된 윈도우 또는 포그라운드 윈도우의 위치 사용
+    hwnd_target = None
+    if gti_success and gti.hwndFocus:
+        hwnd_target = gti.hwndFocus
+    else:
+        hwnd_target = hwnd_fg
+    
+    if hwnd_target:
+        # 윈도우의 클라이언트 영역 중앙 근처에 표시
+        rect = RECT()
+        if user32.GetWindowRect(hwnd_target, ctypes.byref(rect)):
+            # 윈도우 중앙에서 약간 왼쪽 위에 표시
+            center_x = (rect.left + rect.right) // 2
+            center_y = (rect.top + rect.bottom) // 2
+            # 중앙에서 왼쪽 위로 이동
+            badge_x = center_x - 100
+            badge_y = center_y - 50
+            # 윈도우 경계 내로 제한
+            badge_x = max(rect.left + 20, min(badge_x, rect.right - DOT_SIZE - 20))
+            badge_y = max(rect.top + 20, min(badge_y, rect.bottom - DOT_SIZE - 20))
+            return (badge_x, badge_y), hwnd_fg, tid, hwnd_target if gti_success else None
+    
+    # 3. 최후의 수단: 마우스 커서 위치 (윈도우 밖이어도)
+    pt = POINT()
+    if user32.GetCursorPos(ctypes.byref(pt)):
+        return (pt.x, pt.y), hwnd_fg, tid, gti.hwndFocus if gti_success else None
+    
+    return None, hwnd_fg, tid, gti.hwndFocus if gti_success else None
 
 def is_hangul_mode(hwnd_focus: int) -> bool:
     """
@@ -249,7 +291,7 @@ def clamp_to_monitor(x: int, y: int):
 
 # 제어 창 (메인 Tk 인스턴스)
 control_root = tk.Tk()
-control_root.title("IME Caret Indicator")
+control_root.title("koreng")
 control_root.geometry("400x200")
 control_root.resizable(False, False)
 
@@ -351,7 +393,7 @@ def on_closing():
 
 control_root.protocol("WM_DELETE_WINDOW", on_closing)
 
-title_label = tk.Label(control_root, text="IME Caret Indicator", font=("Segoe UI", 14, "bold"))
+title_label = tk.Label(control_root, text="koreng", font=("Segoe UI", 14, "bold"))
 title_label.pack(pady=10)
 
 status_label = tk.Label(control_root, text="상태: 중지됨", font=("Segoe UI", 10))
@@ -382,11 +424,31 @@ def tick():
         return
 
     pos, hwnd_fg, tid, hwnd_focus = get_caret_screen_pos()
-    if not pos or not hwnd_fg or not tid:
-        # 캐럿을 찾을 수 없으면 배지 숨김
+    if not hwnd_fg:
+        # 포그라운드 윈도우가 없으면 배지 숨김
         root.withdraw()
         control_root.after(TICK_MS, tick)
         return
+    
+    # pos가 없어도 hwnd_fg가 있으면 무조건 배지 표시 (크롬, 시스템 앱 대응)
+    if not pos:
+        # 포그라운드 윈도우의 위치를 사용
+        rect = RECT()
+        if user32.GetWindowRect(hwnd_fg, ctypes.byref(rect)):
+            # 윈도우 중앙 근처에 표시
+            center_x = (rect.left + rect.right) // 2
+            center_y = (rect.top + rect.bottom) // 2
+            pos = (center_x - 100, center_y - 50)
+        else:
+            # GetWindowRect 실패 시 마우스 커서 위치 사용
+            pt = POINT()
+            if user32.GetCursorPos(ctypes.byref(pt)):
+                pos = (pt.x, pt.y)
+            else:
+                # 모든 방법 실패 시 배지 숨김
+                root.withdraw()
+                control_root.after(TICK_MS, tick)
+                return
 
     # 포커스 컨트롤 thread로 langid 읽기
     hwnd_for_thread = hwnd_focus if hwnd_focus else hwnd_fg
